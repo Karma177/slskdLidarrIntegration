@@ -1,13 +1,20 @@
 require('events').EventEmitter.defaultMaxListeners = 50;
 
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 const config = require('../../config');
+
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true });
 
 // Usa Axios base con rimozione del Warning Max Listeners
 const slskdClient = axios.create({
     baseURL: config.slskd.apiUrl,
-    headers: { 'X-API-KEY': config.slskd.apiKey }
+    headers: { 'X-API-KEY': config.slskd.apiKey },
+    httpAgent,
+    httpsAgent
 });
 
 /**
@@ -121,19 +128,17 @@ const requestDownload = async (queryObj, blacklist) => {
         const maxWait = 60000;
         const pollInterval = 2000;
         
-        while (waited < maxWait) {
-            await new Promise(resolve => setTimeout(resolve, pollInterval));
-            waited += pollInterval;
-            try {
-                const statusRes = await slskdClient.get(`/api/v0/searches/${searchId}`);
-                if (statusRes.data && (statusRes.data.isComplete || statusRes.data.state !== 'InProgress')) {
-                    console.log(`[SLSKD] Soulseek network finished search in ${waited / 1000}s`);
-                    break;
-                }
-            } catch (err) {}
-        }
-        
-        if (waited >= maxWait) console.log(`[SLSKD] Search ended due to Timeout of ${maxWait / 1000}s.`);
+            while (waited < maxWait) {
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+                waited += pollInterval;
+                try {
+                    const statusRes = await slskdClient.get(`/api/v0/searches/${searchId}`);
+                    if (statusRes.data && (statusRes.data.isComplete || statusRes.data.state === 'Completed' || statusRes.data.state === 'Faulted' || statusRes.data.state === 'Cancelled')) {
+                        console.log(`[SLSKD] Soulseek network finished search in ${waited / 1000}s`);
+                        break;
+                    }
+                } catch (err) {}
+            }        if (waited >= maxWait) console.log(`[SLSKD] Search ended due to Timeout of ${maxWait / 1000}s.`);
         
         const resultsRes = await slskdClient.get(`/api/v0/searches/${searchId}/responses`);
         const responses = resultsRes.data || [];
@@ -196,31 +201,34 @@ const checkDownloadStatus = async (task) => {
         let allComplete = true;
         let foundMatch = false;
         let hasFailed = false;
+        let failedFiles = [];
 
         for (const dl of downloads) {
-            // Controlliamo in modo più sicuro che corrisponda ESATTAMENTE a quella cartella
             if (dl.filename === task.downloadDir || dl.filename.startsWith(task.downloadDir + '\\') || dl.filename.startsWith(task.downloadDir + '/')) {
                 foundMatch = true;
                 totalBytes += dl.size;
                 downloadedBytes += dl.bytesTransferred;
                 
-                if (dl.state.includes('Rejected') || dl.state.includes('Error') || dl.state.includes('Cancelled') || dl.state.includes('Aborted')) {
+                if (dl.state.includes('Rejected') || dl.state.includes('Error') || dl.state.includes('Cancelled') || dl.state.includes('Aborted') || dl.state.includes('TimedOut') || dl.state.includes('Timed Out')) {
                     hasFailed = true;
+                    failedFiles.push(dl);
                 }
                 
-                if (!dl.state.includes('Completed')) {
+                // Un file non è veramente completato se è andato in errore o in timeout, anche se slskd lo indica come "Completed, TimedOut"
+                if (!dl.state.includes('Completed') || dl.state.includes('TimedOut') || dl.state.includes('Error')) {
                     allComplete = false;
                 }
             }
         }
 
-        if (!foundMatch) return { progress: 0, completed: false, failed: false };
+        if (!foundMatch) return { progress: 0, completed: false, failed: false, failedFiles: [] };
 
         const progress = totalBytes > 0 ? (downloadedBytes / totalBytes) : 0;
         return {
             progress: progress,
             completed: (allComplete && totalBytes > 0) && !hasFailed,
             failed: hasFailed,
+            failedFiles: failedFiles,
             totalBytes: totalBytes,
             downloadedBytes: downloadedBytes
         };
@@ -246,9 +254,6 @@ const deleteDownloadFolder = async (directory, username) => {
         
         for (const dir of directories) {
             for (const file of (dir.files || [])) {
-                // Ensure we only delete exactly within this directory
-                // We add a check to make sure it's the exact directory or a subdirectory of it,
-                // and not a partial match (e.g., "Album" shouldn't match "Album 2")
                 if (file.filename === directory || file.filename.startsWith(directory + '\\') || file.filename.startsWith(directory + '/')) {
                     filesToDelete.push(file.id);
                 }
@@ -275,8 +280,29 @@ const deleteDownloadFolder = async (directory, username) => {
     }
 };
 
+/**
+ * Retries specific blocked or failed files for a peer.
+ * @param {string} username - The username of the peer.
+ * @param {Array} files - The array of file objects to retry.
+ * @returns {Promise<boolean>} True if successfully requeued, false otherwise.
+ */
+const retryDownloadFiles = async (username, files) => {
+    try {
+        if (!username || !files || files.length === 0) return false;
+        
+        const filesToDownload = files.map(f => ({ filename: f.filename, size: f.size }));
+        await slskdClient.post(`/api/v0/transfers/downloads/${username}`, filesToDownload);
+        console.log(`[SLSKD] Requeued ${files.length} failed files for user: ${username}`);
+        return true;
+    } catch (error) {
+        console.error('[SLSKD] API retry files failed:', error.message);
+        return false;
+    }
+};
+
 module.exports = {
     requestDownload,
     checkDownloadStatus,
-    deleteDownloadFolder
+    deleteDownloadFolder,
+    retryDownloadFiles
 };

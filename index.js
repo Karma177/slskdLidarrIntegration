@@ -1,35 +1,46 @@
 require('events').EventEmitter.defaultMaxListeners = Infinity;
 
 const express = require('express');
+const axios = require('axios');
+const path = require('path');
 const qbitRoutes = require('./src/server/routes');
 const torznabRoutes = require('./src/server/torznab');
 const queueManager = require('./src/core/queue');
 const config = require('./config');
-const axios = require('axios'); // Added to check connections
 
-// Simple in-memory logger to show logs in the Web UI
 const logs = [];
-const maxLogs = 100;
-function interceptConsole(method) {
+const maxLogs = 1000;
+
+const PORT = config.webServer.port;
+
+const app = express();
+
+/**
+ * Intercepts standard console methods to store logs in memory for the internal Web UI.
+ * @param {string} method - The console method to intercept (e.g., 'log', 'warn', 'error').
+ */
+const interceptConsole = (method) => {
     const original = console[method];
-    console[method] = function (...args) {
-        const message = `[${new Date().toISOString()}] [${method.toUpperCase()}] ` + args.join(' ');
+    console[method] = (...args) => {
+        const message = `[${new Date().toISOString()}] [${method.toUpperCase()}] ${args.join(' ')}`;
         logs.push(message);
         if (logs.length > maxLogs) logs.shift();
         original.apply(console, args);
     };
-}
+};
+
 interceptConsole('log');
 interceptConsole('warn');
 interceptConsole('error');
 
-const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
 
-// Log incoming HTTP requests
-app.use((req, res, next) => {
-    // Skip logging the internal log-fetching endpoint and frequent Lidarr polling to avoid spamming the UI
+/**
+ * Middleware to log incoming HTTP requests, ignoring frequent polling endpoints.
+ * @param {express.Request} req - The Express request object.
+ * @param {express.Response} res - The Express response object.
+ * @param {express.NextFunction} next - The next middleware function.
+ */
+const requestLogger = (req, res, next) => {
     const ignoredPaths = [
         '/api/logs',
         '/api/v2/torrents/info',
@@ -40,63 +51,34 @@ app.use((req, res, next) => {
         '/api/v2/torrents/createCategory',
         '/favicon.ico'
     ];
+
     if (!ignoredPaths.includes(req.path)) {
         console.log(`[HTTP] ${req.method} ${req.originalUrl}`);
     }
     next();
-});
+};
 
-// Simple Web UI
-app.get('/', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Slskd Download Client - Logs</title>
-            <style>
-                body { background-color: #1e1e1e; color: #c5c8c6; font-family: monospace; padding: 20px; }
-                #logs { background-color: #000; padding: 10px; border-radius: 5px; height: 80vh; overflow-y: auto; white-space: pre-wrap; }
-            </style>
-            <script>
-                async function fetchLogs() {
-                    const response = await fetch('/api/logs');
-                    const text = await response.text();
-                    const logsDiv = document.getElementById('logs');
-                    const isScrolledToBottom = logsDiv.scrollHeight - logsDiv.clientHeight <= logsDiv.scrollTop + 1;
-                    logsDiv.textContent = text;
-                    if (isScrolledToBottom) {
-                        logsDiv.scrollTop = logsDiv.scrollHeight;
-                    }
-                }
-                setInterval(fetchLogs, 2000);
-                window.onload = fetchLogs;
-            </script>
-        </head>
-        <body>
-            <h2>Slskd Download Client - Internal Logs</h2>
-            <div id="logs">Loading logs...</div>
-        </body>
-        </html>
-    `);
-});
-
-app.get('/api/logs', (req, res) => {
+/**
+ * Endpoint to retrieve the in-memory array of logs as plain text.
+ * @param {express.Request} req - The Express request object.
+ * @param {express.Response} res - The Express response object.
+ */
+const serveLogs = (req, res) => {
     res.send(logs.join('\n'));
-});
+};
 
-// Load qBittorrent mock endpoints
-app.use('/api/v2', qbitRoutes);
+/**
+ * Bypasses processing for favicon requests.
+ * @param {express.Request} req - The Express request object.
+ * @param {express.Response} res - The Express response object.
+ */
+const ignoreFavicon = (req, res) => res.status(204).end();
 
-// Load Torznab mock indexer endpoints
-app.use('/torznab', torznabRoutes);
-
-// Ignore favicon requests
-app.get('/favicon.ico', (req, res) => res.status(204).end());
-
-const PORT = config.webServer.port;
-
-// Verify connections to dependent services on startup
-async function verifyConnections() {
+/**
+ * Verifies HTTP connectivity to external required services (Lidarr and Slskd) upon boot.
+ * @returns {Promise<void>}
+ */
+const verifyConnections = async () => {
     console.log(`[BOOT] Verifying connections to services...`);
     try {
         await axios.get(`${config.lidarr.apiUrl}/system/status`, {
@@ -117,11 +99,24 @@ async function verifyConnections() {
     } catch (err) {
         console.error(`[BOOT] [FATAL ERROR] Unable to contact Slskd at ${config.slskd.apiUrl}. Error: ${err.message}`);
     }
-}
+};
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(requestLogger);
+
+app.use(express.static(path.join(__dirname, 'src', 'webui')));
+
+app.get('/api/logs', serveLogs);
+app.get('/favicon.ico', ignoreFavicon);
+
+app.use('/api/v2', qbitRoutes);
+app.use('/torznab', torznabRoutes);
+
 
 app.listen(PORT, async () => {
-    console.log(`Mock qBittorrent client running on port ${PORT}`);
+    console.log(`[BOOT] Mock qBittorrent client running on port ${PORT}`);
     await verifyConnections();
-    console.log(`Queue manager check interval active.`);
+    console.log(`[BOOT] Queue manager check interval active.`);
     queueManager.startMonitoring();
 });

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Slskd Download Client</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <script src="/script/app.js"></script>
+</head>
+<body>
+    <div class="navbar">
+        <div class="nav-item" data-target="home">Home</div>
+        <div class="nav-item" data-target="logs">Logs</div>
+        <div class="nav-item" data-target="settings">Settings</div>
+    </div>
+    
+    <div class="container">
+        <div id="home" class="view active">
+            <h2>Active Downloads</h2>
+            <div id="queue-container">
+                <p>Loading queue data...</p>
+            </div>
+        </div>
+
+        <div id="logs" class="view">
+            <h2>Internal Logs</h2>
+            <div id="logs-container">Loading logs...</div>
+        </div>
+
+        <div id="settings" class="view">
+            <h2>Settings</h2>
+            <p>Qui potrai modificare le configurazioni dell'app.</p>
+        </div>
+    </div>
+</body>
+</html>

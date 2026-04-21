@@ -1,6 +1,44 @@
 const slskdApi = require('../slskd/api');
 const config = require('../../config');
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
+
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true });
+
+const lidarrClient = axios.create({
+    baseURL: config.lidarr.apiUrl,
+    headers: { 'X-Api-Key': config.lidarr.apiKey },
+    httpAgent,
+    httpsAgent
+});
+
+/**
+ * A simple asynchronous Mutex for preventing race conditions.
+ */
+class Mutex {
+    constructor() {
+        this.locked = false;
+        this.waiters = [];
+    }
+
+    async acquire() {
+        if (this.locked) {
+            await new Promise(resolve => this.waiters.push(resolve));
+        }
+        this.locked = true;
+    }
+
+    release() {
+        if (this.waiters.length > 0) {
+            const resolve = this.waiters.shift();
+            resolve();
+        } else {
+            this.locked = false;
+        }
+    }
+}
 
 /**
  * Represents a single background download task mapped from Lidarr to Slskd.
@@ -17,6 +55,7 @@ class DownloadTask {
         this.query = typeof nameObj === 'string' ? nameObj : nameObj.filterQuery;
         this.progress = 0;
         this.status = 'pending'; // pending, searching, downloading, completed, error, failed
+        this.errorMessage = '';
         this.downloadUser = null;
         this.downloadDir = null;
         this.downloadStartTime = null;
@@ -25,6 +64,7 @@ class DownloadTask {
         this.importTimer = null;
         this.totalSize = 0;
         this.downloadedSize = 0;
+        this.retriedFiles = new Set();
     }
 
     /**
@@ -66,15 +106,17 @@ class DownloadTask {
     /**
      * Marks the task as having encountered an error (soft failure).
      */
-    markAsError() {
+    markAsError(message = '') {
         this.status = 'error';
+        this.errorMessage = message;
     }
 
     /**
      * Marks the task as completely failed (hard failure, out of retries).
      */
-    markAsFailed() {
+    markAsFailed(message = '') {
         this.status = 'failed';
+        this.errorMessage = message;
     }
 }
 
@@ -89,6 +131,55 @@ class QueueManager {
     constructor() {
         this.tasks = new Map(); // hash -> DownloadTask
         this.failedAttempts = {}; // query -> array of users that failed
+        this.activeSearches = 0;
+        this.searchQueue = [];
+        this.pumpMutex = new Mutex(); // Mutex per prevenire overlap
+    }
+
+    /**
+     * Enqueues a search task to respect Slskd's search concurrency limits.
+     * @param {DownloadTask} task - The task to search for.
+     */
+    enqueueSearch(task) {
+        // Evitiamo di accodare più volte lo stesso task se è già in attesa
+        if (!this.searchQueue.find(t => t.hash === task.hash)) {
+            this.searchQueue.push(task);
+            console.log(`[Queue] Task pushed to search queue: ${task.query}. (Queue position: ${this.searchQueue.length}, Active: ${this.activeSearches}/3)`);
+            this.pumpQueue();
+        } else {
+            console.log(`[Queue] Task ${task.query} is already in the search queue. Ignoring duplicate enqueue.`);
+        }
+    }
+
+    /**
+     * Processes the up to 3 searches iteratively acting as a worker pool.
+     * Uses an async Mutex to synchronize execution and completely eliminate race conditions.
+     */
+    async pumpQueue() {
+        await this.pumpMutex.acquire();
+
+        try {
+            while (this.activeSearches < 3 && this.searchQueue.length > 0) {
+                const task = this.searchQueue.shift();
+                this.activeSearches++;
+
+                console.log(`[Queue] Promoting ${task.query} to active search. (Active: ${this.activeSearches}/3, Remaining in queue: ${this.searchQueue.length})`);
+                if (this.searchQueue.length > 0) {
+                    console.log(`[Queue] Pending searches in queue (${this.searchQueue.length}):`);
+                    this.searchQueue.forEach((t, i) => console.log(`        #${i + 1} - ${t.query}`));
+                }
+
+                // Immediately launch search asynchronously, without awaiting, so the while loop can dispatch up to 3
+                this.executeSlskdSearch(task)
+                    .catch(e => console.error(`[Queue] Error searching ${task.query}:`, e))
+                    .finally(() => {
+                        this.activeSearches--;
+                        this.pumpQueue(); 
+                    });
+            }
+        } finally {
+            this.pumpMutex.release();
+        }
     }
 
     /**
@@ -107,10 +198,18 @@ class QueueManager {
      */
     _mapTaskToQbit(task) {
         let qbitState = 'downloading';
+        let leafDir = '';
+        const dirParts = task.downloadDir ? task.downloadDir.split(/[\\/]/).filter(p => p.trim() !== '') : [];
+        leafDir = dirParts.length > 0 ? dirParts[dirParts.length - 1] : typeof task.name === 'string' ? task.name : task.name.filterQuery;
+
         if (task.status === 'completed' && task.progress === 1) {
             qbitState = 'pausedUP';
         } else if (task.status === 'failed' || task.status === 'error') {
-            qbitState = 'error';
+            // Se impostiamo 'error', Lidarr fissa il messaggio.
+            // Impostiamo `pausedDL` così Lidarr lo mette in Arancione (Warning/Paused),
+            // e alteriamo radicalmente il nome del torrent così che l'errore balzi subito all'occhio.
+            qbitState = 'pausedDL';
+            leafDir = `[SLSKD ERROR: ${task.errorMessage || 'Failed'}] ${leafDir}`;
         }
 
         // Approximate ETA calculation if actively downloading (default to 86400s if stalled)
@@ -123,8 +222,6 @@ class QueueManager {
             eta = dlspeed > 0 ? remainingBytes / dlspeed : 8640000;
         }
 
-        const dirParts = task.downloadDir ? task.downloadDir.split(/[\\/]/).filter(p => p.trim() !== '') : [];
-        const leafDir = dirParts.length > 0 ? dirParts[dirParts.length - 1] : typeof task.name === 'string' ? task.name : task.name.filterQuery;
         let basePath = config.slskd.downloadDir || '/app/data/downloads';
         if (!basePath.startsWith('/') && !/^[a-zA-Z]:/.test(basePath)) {
             basePath = '/' + basePath;
@@ -142,7 +239,8 @@ class QueueManager {
             dlspeed: Math.floor(dlspeed),
             upspeed: 0,
             category: 'lidarr',
-            tags: 'slskd'
+            tags: 'slskd',
+            tracker: task.errorMessage || 'slskd'
         };
     }
 
@@ -156,7 +254,7 @@ class QueueManager {
 
         const task = new DownloadTask(hash, nameObj);
         this.tasks.set(hash, task);
-        await this.executeSlskdSearch(task);
+        this.enqueueSearch(task);
     }
 
     /**
@@ -171,7 +269,7 @@ class QueueManager {
 
         if (!task.canRetry()) {
             console.error(`[Queue] Task ${task.query} exceeded max attempts (${task.maxAttempts}). Marked as failed.`);
-            task.markAsFailed();
+            task.markAsFailed('Exceeded max attempts. No usable results found.');
             return;
         }
 
@@ -183,7 +281,7 @@ class QueueManager {
             task.markAsDownloading(result.user, result.directory);
         } else {
             console.warn(`[Queue] No results found for ${task.query}, will retry in future or eventually flag as error.`);
-            task.markAsError();
+            task.markAsError(result.error || 'No valid results found');
         }
     }
 
@@ -244,8 +342,23 @@ class QueueManager {
         task.downloadedSize = status.downloadedBytes;
         
         if (status.failed) {
+            // Allow one retry per specifically failed file before giving up on the peer
+            const filesToRetry = (status.failedFiles || []).filter(f => !task.retriedFiles.has(f.filename));
+            
+            if (filesToRetry.length > 0) {
+                console.log(`[Queue] Task for ${task.query} has ${filesToRetry.length} failed files. Attempting one retry...`);
+                filesToRetry.forEach(f => task.retriedFiles.add(f.filename));
+                
+                const retrySuccess = await slskdApi.retryDownloadFiles(task.downloadUser, filesToRetry);
+                
+                // Allow the task to keep downloading on success
+                if (retrySuccess) {
+                    return; 
+                }
+            }
+
             console.warn(`[Queue] Task for ${task.query} reported an error or user ${task.downloadUser} rejected the queue. Flagging as error and retrying search.`);
-            this.recordFailureAndRetry(task);
+            this.recordFailureAndRetry(task, `User ${task.downloadUser} rejected or timed out`);
         } else if (status.completed && !task.importTimer) {
             console.log(`[Queue] Album/Track for "${task.query}" successfully downloaded! Notifying Lidarr with 'pausedUP' state to start import.`);
             task.markAsCompleted();
@@ -266,7 +379,7 @@ class QueueManager {
                 if (lStatus.queueId) {
                     await this._removeBlockedItemFromLidarr(lStatus.queueId);
                 }
-                this.recordFailureAndRetry(task);
+                this.recordFailureAndRetry(task, `Lidarr rejected imported files`);
             } else if (lStatus.status === 'imported') {
                 console.log(`[Lidarr] Successfully imported "${task.query}"! Removing from queue.`);
                 this.removeTasks([task.hash]);
@@ -283,9 +396,7 @@ class QueueManager {
      */
     async _removeBlockedItemFromLidarr(queueId) {
         try {
-            await axios.delete(`${config.lidarr.apiUrl}/queue/${queueId}?removeFromClient=false&blocklist=false`, {
-                headers: { 'X-Api-Key': config.lidarr.apiKey }
-            });
+            await lidarrClient.delete(`/queue/${queueId}?removeFromClient=false&blocklist=false`);
             console.log(`[Lidarr] Removed rejected item (ID: ${queueId}) from Lidarr queue.`);
         } catch (e) {
             console.error(`[Lidarr] Unable to remove item from queue: ${e.message}`);
@@ -314,10 +425,11 @@ class QueueManager {
      * Records a failure for a specific peer on a task, wipes the local failed payload, and retries.
      * @param {DownloadTask} task - The failing task.
      */
-    recordFailureAndRetry(task) {
+    recordFailureAndRetry(task, errorMessage = '') {
         if (!this.failedAttempts[task.query]) this.failedAttempts[task.query] = [];
         if (task.downloadUser) {
             this.failedAttempts[task.query].push(task.downloadUser);
+            // Non blocchiamo l'esecuzione per completare questo delete
             slskdApi.deleteDownloadFolder(task.downloadDir, task.downloadUser).catch(e => console.error(e));
         }
         
@@ -325,21 +437,21 @@ class QueueManager {
             clearTimeout(task.importTimer);
             task.importTimer = null;
         }
-        
-        task.progress = 0;
-        this.executeSlskdSearch(task);
-    }
 
-    /**
+        task.progress = 0;
+        task.status = 'pending';
+        task.downloadUser = null;
+        task.downloadDir = null;
+        if (errorMessage) task.errorMessage = errorMessage;
+        this.enqueueSearch(task);
+    }    /**
      * Queries Lidarr APIs directly to determine the import state of the downloaded file.
      * @param {DownloadTask} task - The downloaded task in question.
      * @returns {Promise<Object>} An object determining whether the status is pending, blocked, imported, or unknown.
      */
     async checkLidarrImport(task) {
         try {
-            const res = await axios.get(`${config.lidarr.apiUrl}/queue`, {
-                headers: { 'X-Api-Key': config.lidarr.apiKey }
-            });
+            const res = await lidarrClient.get(`/queue`);
             
             const records = res.data.records || [];
             const qItem = records.find(r => r.downloadId === task.hash);
@@ -348,7 +460,11 @@ class QueueManager {
                 const isBlocked = qItem.trackedDownloadState === 'ImportBlocked' || qItem.status === 'Warning';
                 if (isBlocked) {
                     const warnings = (qItem.statusMessages || []).map(m => m.messages.join(', ')).join(' | ');
-                    console.log(`[Lidarr-Check] Lidarr refuses to import ${task.query}: ${warnings}. Blacklisting user & retrying.`);
+                    // Logga solo saltuariamente l'errore per non intasare la console
+                    if (!task.lastLidarrWarn || Date.now() - task.lastLidarrWarn > 30000) {
+                        console.log(`[Lidarr-Check] Lidarr refuses to import ${task.query}: ${warnings}. Blacklisting user & retrying.`);
+                        task.lastLidarrWarn = Date.now();
+                    }
                     return { status: 'blocked', queueId: qItem.id };
                 }
                 return { status: 'pending' };
@@ -356,13 +472,22 @@ class QueueManager {
             
             // If it's not in Lidarr's queue but was marked completed, it might have been successfully imported
             // and removed from the queue. Let's check the history.
-            const histRes = await axios.get(`${config.lidarr.apiUrl}/history?page=1&pageSize=30&sortDirection=descending&sortKey=date`, {
-                headers: { 'X-Api-Key': config.lidarr.apiKey }
+            // Lidarr può usare nomi come albumFolderImported, trackImported o downloadFolderImported
+            const histRes = await lidarrClient.get(`/history?page=1&pageSize=100&sortDirection=descending&sortKey=date`);
+            const imported = histRes.data.records.some(r => {
+                const matchHash = r.downloadId && r.downloadId.toLowerCase() === task.hash.toLowerCase();
+                const isSuccessEvent = r.eventType && r.eventType.toLowerCase().includes('import');
+                return matchHash && isSuccessEvent;
             });
-            const imported = histRes.data.records.some(r => r.eventType === 'downloadFolderImported' && r.downloadId === task.hash);
             
             if (imported) {
                  return { status: 'imported' };
+            }
+            
+            // Se non c'è in locale, né in cronologia come importato, assumiamo che Lidarr lo abbia abbandonato
+            if (!task.lastUnknownLog || Date.now() - task.lastUnknownLog > 60000) {
+                console.log(`[Lidarr-Check] Item non trovato né in coda né in history come import. DownloadId: ${task.hash}. In attesa che Lidarr lo processi...`);
+                task.lastUnknownLog = Date.now();
             }
             return { status: 'unknown' };
 
