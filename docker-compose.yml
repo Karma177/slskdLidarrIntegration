@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  slskd-download-client:
+    build: .
+    container_name: slskd_qbit_mock
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - SLSKD_API_URL=http://192.168.0.229:5030
+      - SLSKD_API_KEY=12345678912121212121212
+      - LIDARR_API_URL=http://192.168.0.229:8686/api/v1
+      - LIDARR_API_KEY=02665b89255848e5958e658953d32d00
+      - QUERY_TEMPLATE={artist} {album}
+      - IMPORT_TIMEOUT=120000
+      - QUALITY_PREFERENCES=flac 44, flac 48, flac, 320, mp3
+      - MAX_RETRIES=3
+      - SLSKD_DOWNLOAD_DIR=/slskd_downloads # Same mapped path Lidarr/Slskd uses for downloads
+    restart: unless-stopped
