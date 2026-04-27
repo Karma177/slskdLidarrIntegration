@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+@theme {
+  --color-spotify-green: #1DB954;
+  --color-dark-bg: #000000;
+  --color-dark-card: #121212;
+  --color-dark-card-hover: #181818;
+  --color-dark-border: rgba(255, 255, 255, 0.05);
+  --color-terminal-bg: #080808;
+  --color-terminal-border: #333333;
+  --color-input-dark: #3E3E3E;
+}
+
+@layer components {
+  .spotify-green { 
+    @apply text-spotify-green; 
+  } 
+  .bg-spotify-green { 
+    @apply bg-spotify-green; 
+  } 
+  .card { 
+    @apply bg-dark-card rounded-lg transition-colors duration-300; 
+  } 
+  .card:hover { 
+    @apply bg-dark-card-hover; 
+  } 
+  .tag { 
+    @apply text-[9px] px-1.5 py-0.5 rounded font-bold uppercase; 
+  } 
+  .tag-track { 
+    @apply border border-spotify-green text-spotify-green; 
+  } 
+  .tag-album { 
+    @apply border border-white text-white; 
+  } 
+  .terminal { 
+    @apply bg-terminal-bg border border-terminal-border font-mono text-[11px] p-2.5 text-spotify-green; 
+  } 
+  .sidebar-item { 
+    @apply flex items-center gap-3 px-4 py-3 text-[#B3B3B3] font-semibold cursor-pointer rounded transition-colors; 
+  } 
+  .sidebar-item.active { 
+    @apply text-white bg-[#282828]; 
+  }
+  .sidebar-item:not(.active):hover {
+    @apply text-white;
+  }
+  .input-dark { 
+    @apply bg-input-dark border-none px-3 py-2 rounded text-white w-full text-[13px] focus:outline-none focus:ring-1 focus:ring-spotify-green; 
+  } 
+  .input-label { 
+    @apply text-[#B3B3B3] text-[11px] font-bold uppercase tracking-wider mb-1 block; 
+  }
+}

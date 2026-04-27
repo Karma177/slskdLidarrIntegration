@@ -1,130 +1,18 @@
-const slskdApi = require('../slskd/api');
-const config = require('../../config');
-const axios = require('axios');
-const http = require('http');
-const https = require('https');
-
-const httpAgent = new http.Agent({ keepAlive: true });
-const httpsAgent = new https.Agent({ keepAlive: true });
-
-const lidarrClient = axios.create({
-    baseURL: config.lidarr.apiUrl,
-    headers: { 'X-Api-Key': config.lidarr.apiKey },
-    httpAgent,
-    httpsAgent
-});
-
-/**
- * A simple asynchronous Mutex for preventing race conditions.
- */
-class Mutex {
-    constructor() {
-        this.locked = false;
-        this.waiters = [];
-    }
-
-    async acquire() {
-        if (this.locked) {
-            await new Promise(resolve => this.waiters.push(resolve));
-        }
-        this.locked = true;
-    }
-
-    release() {
-        if (this.waiters.length > 0) {
-            const resolve = this.waiters.shift();
-            resolve();
-        } else {
-            this.locked = false;
-        }
-    }
-}
-
-/**
- * Represents a single background download task mapped from Lidarr to Slskd.
- */
-class DownloadTask {
-    /**
-     * Initializes a new Download Task.
-     * @param {string} hash - The unique hash identifying the task.
-     * @param {string|Object} nameObj - The parsed name or query object from Lidarr.
-     */
-    constructor(hash, nameObj) {
-        this.hash = hash;
-        this.name = nameObj;
-        this.query = typeof nameObj === 'string' ? nameObj : nameObj.filterQuery;
-        this.progress = 0;
-        this.status = 'pending'; // pending, searching, downloading, completed, error, failed
-        this.errorMessage = '';
-        this.downloadUser = null;
-        this.downloadDir = null;
-        this.downloadStartTime = null;
-        this.attempts = 0;
-        this.maxAttempts = config.slskd.maxRetries || 3;
-        this.importTimer = null;
-        this.totalSize = 0;
-        this.downloadedSize = 0;
-        this.retriedFiles = new Set();
-    }
-
-    /**
-     * Checks if the task is allowed to retry searches.
-     * @returns {boolean} True if attempts are less than max attempts.
-     */
-    canRetry() {
-        return this.attempts < this.maxAttempts;
-    }
-
-    /**
-     * Marks the task as actively searching on Slskd and increments the attempt counter.
-     */
-    markAsSearching() {
-        this.status = 'searching';
-        this.attempts++;
-    }
-
-    /**
-     * Marks the task as actively downloading files from a specific user.
-     * @param {string} user - The Slskd username being downloaded from.
-     * @param {string} dir - The remote directory path being downloaded.
-     */
-    markAsDownloading(user, dir) {
-        this.status = 'downloading';
-        this.downloadUser = user;
-        this.downloadDir = dir;
-        this.downloadStartTime = Date.now();
-    }
-
-    /**
-     * Marks the task as fully downloaded and ready for Lidarr import.
-     */
-    markAsCompleted() {
-        this.status = 'completed';
-        this.progress = 1;
-    }
-
-    /**
-     * Marks the task as having encountered an error (soft failure).
-     */
-    markAsError(message = '') {
-        this.status = 'error';
-        this.errorMessage = message;
-    }
-
-    /**
-     * Marks the task as completely failed (hard failure, out of retries).
-     */
-    markAsFailed(message = '') {
-        this.status = 'failed';
-        this.errorMessage = message;
-    }
-}
+const slskdApi = require('./services/slskd/api');
+const lidarrBridge = require('./services/lidarr/lidarr-bridge');
+const dbManager = require('./db/db-access');
+const Mutex = require('./utils/mutex');
+const DownloadTask = require('./DownloadTask');
 
 /**
  * Manages the entire lifecycle of download tasks, including queuing, polling states,
  * interacting with the Slskd API, and updating Lidarr's state.
  */
 class QueueManager {
+    static handlers = {
+        'slskd': require('./queue/handlers/slskd-handler')
+    };
+
     /**
      * Initializes the QueueManager.
      */
@@ -134,6 +22,11 @@ class QueueManager {
         this.activeSearches = 0;
         this.searchQueue = [];
         this.pumpMutex = new Mutex(); // Mutex per prevenire overlap
+        
+        const LucidaQueueHandler = require('./queue/handlers/lucida-handler');
+        QueueManager.handlers['tidal'] = new LucidaQueueHandler('tidal');
+        QueueManager.handlers['qobuz'] = new LucidaQueueHandler('qobuz');
+        QueueManager.handlers['spotify'] = new LucidaQueueHandler('spotify');
     }
 
     /**
@@ -170,7 +63,7 @@ class QueueManager {
                 }
 
                 // Immediately launch search asynchronously, without awaiting, so the while loop can dispatch up to 3
-                this.executeSlskdSearch(task)
+                this.executeSearchWithFallback(task)
                     .catch(e => console.error(`[Queue] Error searching ${task.query}:`, e))
                     .finally(() => {
                         this.activeSearches--;
@@ -222,7 +115,7 @@ class QueueManager {
             eta = dlspeed > 0 ? remainingBytes / dlspeed : 8640000;
         }
 
-        let basePath = config.slskd.downloadDir || '/app/data/downloads';
+        let basePath = dbManager.getSetting('slskd_download_dir') || '/app/data/downloads';
         if (!basePath.startsWith('/') && !/^[a-zA-Z]:/.test(basePath)) {
             basePath = '/' + basePath;
         }
@@ -257,31 +150,54 @@ class QueueManager {
         this.enqueueSearch(task);
     }
 
-    /**
-     * Commands the Slskd API to initiate a search and attempt downloading the task.
-     * @param {DownloadTask} task - The task object initiating the search.
-     */
-    async executeSlskdSearch(task) {
-        if (!this.tasks.has(task.hash)) {
-            console.log(`[Queue] Task ${task.query} was removed manually, cancelling Slskd search.`);
+    async executeSearchWithFallback(task) {
+        const fallbacks = task.fallbackOrder; // Es. ['slskd', 'lucida', 'tidal'] ecc
+        const currentIndex = task.currentQueueHandlerIndex;
+
+        // Se abbiamo finito tutti i tentativi e tutti i provider... 
+        if (currentIndex >= fallbacks.length) {
+            console.error(`[Queue] Task ${task.query} has exhausted all fallback options. Marking as failed.`);
+            task.markAsFailed('Exceeded all fallback handlers. No usable results found.');
             return;
         }
 
-        if (!task.canRetry()) {
-            console.error(`[Queue] Task ${task.query} exceeded max attempts (${task.maxAttempts}). Marked as failed.`);
-            task.markAsFailed('Exceeded max attempts. No usable results found.');
-            return;
+        const providerName = fallbacks[currentIndex];
+        console.log(`[Queue] Inviando task ${task.query} al provider: ${providerName} (Fallback: ${currentIndex + 1}/${fallbacks.length})`);
+
+        // Otteniamo il gestore corrispondente a questo nome
+        const handler = QueueManager.handlers[providerName];
+        if (!handler) {
+            console.warn(`[Queue] Provider sconosciuto "${providerName}". Passo al prossimo fallback.`);
+            task.currentQueueHandlerIndex++;
+            return this.executeSearchWithFallback(task);
         }
 
-        task.markAsSearching();
-        const failedUsers = this.failedAttempts[task.query] || [];
-        const result = await slskdApi.requestDownload(task.name, failedUsers);
-        
-        if (result.success) {
-            task.markAsDownloading(result.user, result.directory);
-        } else {
-            console.warn(`[Queue] No results found for ${task.query}, will retry in future or eventually flag as error.`);
-            task.markAsError(result.error || 'No valid results found');
+        try {
+            // "Esegue" o "Accoda" sul gestore specifico
+            // Nel tuo design, passiamo la chiamata al gestore. E lui ritornerà un esito o metterà in loop.
+            const result = await handler.execute(task);
+
+            if (result.success) {
+                // Il gestore ha accettato il file / o completato il download/scaricamento ed è visibile a Lidarr
+                console.log(`[Queue] [${providerName}] ha gestito con successo il task ${task.query}`);
+            } else {
+                // Il gestore non è in grado di procedere con la traccia *specifica* per mancati retry o assenza di fondi. 
+                if (result.retryAllowed) {
+                    console.log(`[Queue] [${providerName}] Tentativo fallito, ma retry consentito. Riproviamo...`);
+                    // Rimandiamo in coda nello stesso handler (ad es Slskd al retry 2 o 3)
+                    this.recordFailureAndRetry(task, result.error); 
+                } else {
+                    console.log(`[Queue] [${providerName}] Impossibile soddisfare task. Passaggio a fallback successivo.`);
+                    task.currentQueueHandlerIndex++;
+                    task.attempts = 0; // reset tenta per un eventuale altro servizio 
+                    return this.executeSearchWithFallback(task);
+                }
+            }
+        } catch (error) {
+            console.error(`[Queue] [${providerName}] Critical Handler Error:`, error.message);
+            // Errore server o API; andiamo al fallback successivo
+            task.currentQueueHandlerIndex++;
+            return this.executeSearchWithFallback(task);
         }
     }
 
@@ -323,6 +239,8 @@ class QueueManager {
                     await this._processCompletedTask(task);
                 }
             }
+            
+            await this.enforceQueueConsistency();
             
             setTimeout(checkLoop, 5000);
         };
@@ -396,7 +314,7 @@ class QueueManager {
      */
     async _removeBlockedItemFromLidarr(queueId) {
         try {
-            await lidarrClient.delete(`/queue/${queueId}?removeFromClient=false&blocklist=false`);
+            await lidarrBridge.deleteQueueItem(queueId);
             console.log(`[Lidarr] Removed rejected item (ID: ${queueId}) from Lidarr queue.`);
         } catch (e) {
             console.error(`[Lidarr] Unable to remove item from queue: ${e.message}`);
@@ -418,7 +336,7 @@ class QueueManager {
                 console.log(`[Queue] Lidarr is still processing ${task.query}, giving it more time...`);
                 this.startImportTimeout(task);
             }
-        }, config.importTimeout || 600000);
+        }, parseInt(dbManager.getSetting('import_timeout')) || 600000);
     }
 
     /**
@@ -451,9 +369,7 @@ class QueueManager {
      */
     async checkLidarrImport(task) {
         try {
-            const res = await lidarrClient.get(`/queue`);
-            
-            const records = res.data.records || [];
+            const records = await lidarrBridge.getQueue();
             const qItem = records.find(r => r.downloadId === task.hash);
             
             if (qItem) {
@@ -473,8 +389,8 @@ class QueueManager {
             // If it's not in Lidarr's queue but was marked completed, it might have been successfully imported
             // and removed from the queue. Let's check the history.
             // Lidarr può usare nomi come albumFolderImported, trackImported o downloadFolderImported
-            const histRes = await lidarrClient.get(`/history?page=1&pageSize=100&sortDirection=descending&sortKey=date`);
-            const imported = histRes.data.records.some(r => {
+            const histRecords = await lidarrBridge.getHistory();
+            const imported = histRecords.some(r => {
                 const matchHash = r.downloadId && r.downloadId.toLowerCase() === task.hash.toLowerCase();
                 const isSuccessEvent = r.eventType && r.eventType.toLowerCase().includes('import');
                 return matchHash && isSuccessEvent;
@@ -494,6 +410,37 @@ class QueueManager {
         } catch (error) {
             console.error(`[Lidarr-Check] API Error: ${error.message}`);
             return { status: 'error' };
+        }
+    }
+
+    async removeLidarrQueueItem(hash, queueId) {
+        try {
+            await lidarrBridge.deleteQueueItem(queueId);
+            console.log(`[Queue] Removed task ${this.tasks.get(hash)?.query} from Lidarr queue.`);
+        } catch (err) {
+            console.error(`[Queue] Failed to remove task ${this.tasks.get(hash)?.query} from Lidarr queue:`, err.message);
+        }
+    }
+
+    async enforceQueueConsistency() {
+        try {
+            const lidarrQueue = await lidarrBridge.getQueue();
+            const lidarrHistory = await lidarrBridge.getHistory();
+
+            for (const [hash, task] of this.tasks.entries()) {
+                const queueItem = lidarrQueue.find(q => q.downloadId === hash);
+                if (!queueItem) {
+                    // Non c'è più in coda, verifichiamo la cronologia
+                    const histItem = lidarrHistory.find(h => h.downloadId === hash);
+                    if (histItem) {
+                        // Trovato in cronologia, presumibilmente importato
+                        console.log(`[Queue] Task ${task.query} appears to be imported already. Removing from active queue.`);
+                        this.removeTasks([hash]);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error(`[Queue] Consistency check failed:`, err.message);
         }
     }
 }

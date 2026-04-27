@@ -4,18 +4,31 @@ const axios = require('axios');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
-const config = require('../../config');
+const dbManager = require('../../db/db-access');
 
 const httpAgent = new http.Agent({ keepAlive: true });
 const httpsAgent = new https.Agent({ keepAlive: true });
 
-// Usa Axios base con rimozione del Warning Max Listeners
-const slskdClient = axios.create({
-    baseURL: config.slskd.apiUrl,
-    headers: { 'X-API-KEY': config.slskd.apiKey },
-    httpAgent,
-    httpsAgent
-});
+const formatError = (err) => {
+    if (err.response) return `HTTP ${err.response.status} - ${err.response.statusText}`;
+    let msg = err.message || err.toString();
+    const errors = err.errors || (err.cause && err.cause.errors) || [];
+    if (Array.isArray(errors) && errors.length > 0) {
+        return `${msg} - Details: ${errors.map(e => e.message || e).join(', ')}`;
+    }
+    if (err.cause) return `${msg} (Cause: ${err.cause.message || err.cause})`;
+    return msg;
+};
+
+function getSlskdClient() {
+    const slskdApi = dbManager.getApi('slskd');
+    return axios.create({
+        baseURL: slskdApi?.api_url || '',
+        headers: { 'X-API-KEY': slskdApi?.api_key || '' },
+        httpAgent,
+        httpsAgent
+    });
+}
 
 /**
  * Generates a random GUID/UUID string for search IDs.
@@ -88,7 +101,8 @@ const findBestCandidate = (responses, queryWords, blacklist) => {
 
             let score = (lcsScoreDir * 0.7) + (jumbledScorePath * 0.3);
 
-            const preferences = config.qualityPreferences || [];
+            const prefsStr = dbManager.getSetting('quality_preferences');
+            const preferences = prefsStr ? prefsStr.split(',').map(s => s.trim()) : [];
             for (let i = 0; i < preferences.length; i++) {
                 const prefWord = normalizeStr(preferences[i]);
                 if (prefWord && normPath.includes(prefWord)) {
@@ -122,7 +136,7 @@ const requestDownload = async (queryObj, blacklist) => {
         const filterQuery = typeof queryObj === 'string' ? queryObj : queryObj.filterQuery;
         console.log(`[SLSKD] Starting search for: ${networkQuery} (Filter: ${filterQuery})`);
         
-        await slskdClient.post('/api/v0/searches', { id: searchId, searchText: networkQuery });
+        await getSlskdClient().post('/api/v0/searches', { id: searchId, searchText: networkQuery });
         
         let waited = 0;
         const maxWait = 60000;
@@ -132,7 +146,7 @@ const requestDownload = async (queryObj, blacklist) => {
                 await new Promise(resolve => setTimeout(resolve, pollInterval));
                 waited += pollInterval;
                 try {
-                    const statusRes = await slskdClient.get(`/api/v0/searches/${searchId}`);
+                    const statusRes = await getSlskdClient().get(`/api/v0/searches/${searchId}`);
                     if (statusRes.data && (statusRes.data.isComplete || statusRes.data.state === 'Completed' || statusRes.data.state === 'Faulted' || statusRes.data.state === 'Cancelled')) {
                         console.log(`[SLSKD] Soulseek network finished search in ${waited / 1000}s`);
                         break;
@@ -140,19 +154,19 @@ const requestDownload = async (queryObj, blacklist) => {
                 } catch (err) {}
             }        if (waited >= maxWait) console.log(`[SLSKD] Search ended due to Timeout of ${maxWait / 1000}s.`);
         
-        const resultsRes = await slskdClient.get(`/api/v0/searches/${searchId}/responses`);
+        const resultsRes = await getSlskdClient().get(`/api/v0/searches/${searchId}/responses`);
         const responses = resultsRes.data || [];
         console.log(`[SLSKD] Search gathered ${responses.length} user responses.`);
-        
+
         const queryWords = normalizeStr(filterQuery).split(' ').filter(w => w.trim().length > 2);
         const bestCandidate = findBestCandidate(responses, queryWords, blacklist);
-        
-        await slskdClient.delete(`/api/v0/searches/${searchId}`);
-        
+
+        await getSlskdClient().delete(`/api/v0/searches/${searchId}`);
+
         if (bestCandidate) {
             console.log(`[SLSKD] Best match: ${bestCandidate.username} with score ${bestCandidate.score.toFixed(2)}`);
             console.log(`[SLSKD] Enqueuing download from ${bestCandidate.username} for folder: ${bestCandidate.dirPath}`);
-            
+
             const userResponse = responses.find(r => r.username === bestCandidate.username);
             let filesToDownload = [];
             if (userResponse && userResponse.files) {
@@ -160,13 +174,13 @@ const requestDownload = async (queryObj, blacklist) => {
                     .filter(f => f.filename.startsWith(bestCandidate.dirPath))
                     .map(f => ({ filename: f.filename, size: f.size }));
             }
-            
+
             if (filesToDownload.length === 0) {
                 const fallbackFile = userResponse && userResponse.files ? userResponse.files.find(f => f.filename === bestCandidate.filename) : null;
                 filesToDownload = [{ filename: bestCandidate.filename, size: fallbackFile ? fallbackFile.size : 0 }];
             }
 
-            await slskdClient.post(`/api/v0/transfers/downloads/${bestCandidate.username}`, filesToDownload);
+            await getSlskdClient().post(`/api/v0/transfers/downloads/${bestCandidate.username}`, filesToDownload);
             return { success: true, user: bestCandidate.username, directory: bestCandidate.dirPath };
         }
 
@@ -189,11 +203,9 @@ const checkDownloadStatus = async (task) => {
             console.log(`[SLSKD] No download user associated with task ${task.name}, cannot check status.`);
             return { progress: 0, completed: false };
         }
-        
-        const res = await slskdClient.get(`/api/v0/transfers/downloads/${task.downloadUser}`);
-        const directories = res.data.directories || [];
-        
-        let downloads = [];
+
+        const res = await getSlskdClient().get(`/api/v0/transfers/downloads/${task.downloadUser}`);
+        const directories = res.data.directories || [];        let downloads = [];
         for (const dir of directories) downloads = downloads.concat(dir.files || []);
         
         let totalBytes = 0;
@@ -247,12 +259,10 @@ const checkDownloadStatus = async (task) => {
 const deleteDownloadFolder = async (directory, username) => {
     try {
         if (!username || !directory || directory.trim() === '') return false;
-        
-        const res = await slskdClient.get(`/api/v0/transfers/downloads/${username}`);
+
+        const res = await getSlskdClient().get(`/api/v0/transfers/downloads/${username}`);
         const directories = res.data.directories || [];
-        let filesToDelete = [];
-        
-        for (const dir of directories) {
+        let filesToDelete = [];        for (const dir of directories) {
             for (const file of (dir.files || [])) {
                 if (file.filename === directory || file.filename.startsWith(directory + '\\') || file.filename.startsWith(directory + '/')) {
                     filesToDelete.push(file.id);
@@ -266,7 +276,7 @@ const deleteDownloadFolder = async (directory, username) => {
         
         for (const id of filesToDelete) {
             try {
-                await slskdClient.delete(`/api/v0/transfers/downloads/${username}/${id}`);
+                await getSlskdClient().delete(`/api/v0/transfers/downloads/${username}/${id}`);
             } catch (err) {
                 console.error(`[SLSKD] Error deleting transfer ${id} per ${username}:`, err.message);
             }
@@ -291,7 +301,7 @@ const retryDownloadFiles = async (username, files) => {
         if (!username || !files || files.length === 0) return false;
         
         const filesToDownload = files.map(f => ({ filename: f.filename, size: f.size }));
-        await slskdClient.post(`/api/v0/transfers/downloads/${username}`, filesToDownload);
+        await getSlskdClient().post(`/api/v0/transfers/downloads/${username}`, filesToDownload);
         console.log(`[SLSKD] Requeued ${files.length} failed files for user: ${username}`);
         return true;
     } catch (error) {

@@ -1,14 +1,10 @@
-const express = require('express');
-const router = express.Router();
-const crypto = require('crypto');
-const dbManager = require('../core/db/db-access');
+import express from 'express';
+import crypto from 'crypto';
+import { getSettings } from './db.js';
 
-/**
- * Generates the Torznab capabilities XML.
- * @param {import('express').Response} res - The Express response object.
- * @returns {void}
- */
-function handleCaps(res) {
+const router = express.Router();
+
+function handleCaps(res: express.Response) {
     const capsXml = `<?xml version="1.0" encoding="UTF-8"?>
         <caps>
             <server version="1.0" title="Slskd Torznab Proxy"/>
@@ -28,15 +24,10 @@ function handleCaps(res) {
                 </category>
             </categories>
         </caps>`;
-    return res.send(capsXml);
+    return res.type('application/rss+xml').send(capsXml);
 }
 
-/**
- * Generates a dummy Torznab response for empty RSS sync queries to satisfy Lidarr's checks.
- * @param {import('express').Response} res - The Express response object.
- * @returns {void}
- */
-function handleEmptySearch(res) {
+function handleEmptySearch(res: express.Response) {
     const pubDate = new Date().toUTCString();
     const fakeHash = crypto.createHash('sha1').update('dummy' + Date.now()).digest('hex');
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -65,30 +56,25 @@ function handleEmptySearch(res) {
                     </item>
                 </channel>
             </rss>`;
-    return res.send(xml);
+    return res.type('application/rss+xml').send(xml);
 }
 
-/**
- * Processes an active search query from Lidarr and returns a mocked Torznab result.
- * @param {import('express').Request} req - The Express request object.
- * @param {import('express').Response} res - The Express response object.
- * @returns {void}
- */
-function handleActiveSearch(req, res) {
-    const { q, artist = '', album = '', title = '', year } = req.query;
+function handleActiveSearch(req: express.Request, res: express.Response) {
+    const { q, artist = '', album = '', title = '', year } = req.query as { q?: string; artist?: string; album?: string; title?: string; year?: string };
     
     let rawString = q ? q : `${artist} ${album} ${title}`.trim();
-    rawString = rawString.replace(/\s+/g, ' ');
+    rawString = rawString.replace(/\\s+/g, ' ');
 
     let networkQuery = rawString;
+    const settings = getSettings();
     
     if (artist || album) {
-        let template = dbManager.getSetting('query_template') || '{artist} {album}';
+        let template = settings.queryFormat || '{artist} {album}';
         networkQuery = template
             .replace('{artist}', artist)
             .replace('{album}', album)
             .replace('{title}', title)
-            .replace(/\s+/g, ' ')
+            .replace(/\\s+/g, ' ')
             .trim();
     } else if (q) {
         networkQuery = q.trim();
@@ -143,17 +129,12 @@ function handleActiveSearch(req, res) {
             </channel>
         </rss>`;
 
-    return res.send(searchXml);
+    return res.type('application/rss+xml').send(searchXml);
 }
 
-/**
- * Generates an empty fallback RSS feed.
- * @param {import('express').Response} res - The Express response object.
- * @returns {void}
- */
-function handleFallback(res) {
+function handleFallback(res: express.Response) {
     const pubDate = new Date().toUTCString();
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+    return res.type('application/rss+xml').send(`<?xml version="1.0" encoding="UTF-8"?>
     <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2.0/torznab">
         <channel>
             <title>Fallback</title>
@@ -164,16 +145,10 @@ function handleFallback(res) {
     </rss>`);
 }
 
-/**
- * GET /api
- * Main Torznab endpoint for Lidarr queries.
- */
 router.get('/api', (req, res) => {
     const { t, q, artist, album, title } = req.query;
 
     console.log(`[Torznab] Incoming query type: ${t}, query: "${q || 'none'}"`);
-
-    res.set('Content-Type', 'application/rss+xml');
 
     if (t === 'caps') {
         return handleCaps(res);
@@ -189,4 +164,4 @@ router.get('/api', (req, res) => {
     return handleFallback(res);
 });
 
-module.exports = router;
+export default router;

@@ -6,13 +6,12 @@ const path = require('path');
 const qbitRoutes = require('./src/server/routes');
 const torznabRoutes = require('./src/server/torznab');
 const queueManager = require('./src/core/queue');
-const config = require('./config');
-
 const logs = [];
 const maxLogs = 1000;
 
-const PORT = config.webServer.port;
-
+// Read runtime configuration from the DB (populated at first-run from env/docker)
+const dbManager = require('./src/core/db/db-access');
+const PORT = parseInt(dbManager.getSetting('port') || process.env.PORT || '8080', 10);
 const app = express();
 
 /**
@@ -64,7 +63,7 @@ const requestLogger = (req, res, next) => {
  * @param {express.Response} res - The Express response object.
  */
 const serveLogs = (req, res) => {
-    res.send(logs.join('\n'));
+    res.json(logs);
 };
 
 /**
@@ -78,26 +77,41 @@ const ignoreFavicon = (req, res) => res.status(204).end();
  * Verifies HTTP connectivity to external required services (Lidarr and Slskd) upon boot.
  * @returns {Promise<void>}
  */
+const formatError = (err) => {
+    if (err.response) return `HTTP ${err.response.status} - ${err.response.statusText}`;
+    let msg = err.message || err.toString();
+    const errors = err.errors || (err.cause && err.cause.errors) || [];
+    if (Array.isArray(errors) && errors.length > 0) {
+        return `${msg} - Details: ${errors.map(e => e.message || e).join(', ')}`;
+    }
+    if (err.cause) return `${msg} (Cause: ${err.cause.message || err.cause})`;
+    return msg;
+};
+
 const verifyConnections = async () => {
     console.log(`[BOOT] Verifying connections to services...`);
     try {
-        await axios.get(`${config.lidarr.apiUrl}/system/status`, {
-            headers: { 'X-Api-Key': config.lidarr.apiKey },
+        const lidarrApi = dbManager.getApi('lidarr') || {};
+        await axios.get(`${lidarrApi.api_url}/system/status`, {
+            headers: { 'X-Api-Key': lidarrApi.api_key },
             timeout: 5000
         });
-        console.log(`[BOOT] [OK] Successfully connected to Lidarr: ${config.lidarr.apiUrl}`);
+        console.log(`[BOOT] [OK] Successfully connected to Lidarr: ${lidarrApi.api_url}`);
     } catch (err) {
-        console.error(`[BOOT] [FATAL ERROR] Unable to contact Lidarr at ${config.lidarr.apiUrl}. Error: ${err.message}`);
+        const lidarrApi = dbManager.getApi('lidarr') || {};
+        console.error(`[BOOT] [FATAL ERROR] Unable to contact Lidarr at ${lidarrApi.api_url}. Error: ${formatError(err)}`);
     }
 
     try {
-        await axios.get(`${config.slskd.apiUrl}/api/v0/application/info`, {
-            headers: { 'X-API-KEY': config.slskd.apiKey },
+        const slskdApi = dbManager.getApi('slskd') || {};
+        await axios.get(`${slskdApi.api_url}/api/v0/application/info`, {
+            headers: { 'X-API-KEY': slskdApi.api_key },
             timeout: 5000
         });
-        console.log(`[BOOT] [OK] Successfully connected to Slskd API: ${config.slskd.apiUrl}`);
+        console.log(`[BOOT] [OK] Successfully connected to Slskd API: ${slskdApi.api_url}`);
     } catch (err) {
-        console.error(`[BOOT] [FATAL ERROR] Unable to contact Slskd at ${config.slskd.apiUrl}. Error: ${err.message}`);
+        const slskdApi = dbManager.getApi('slskd') || {};
+        console.error(`[BOOT] [FATAL ERROR] Unable to contact Slskd at ${slskdApi.api_url}. Error: ${formatError(err)}`);
     }
 };
 
@@ -105,14 +119,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(requestLogger);
 
-app.use(express.static(path.join(__dirname, 'src', 'webui')));
+const webUiApi = require('./src/server/webui-api');
+
+app.use(express.static(path.join(__dirname, 'src', 'core', 'ui')));
 
 app.get('/api/logs', serveLogs);
+app.use('/api', webUiApi); // Aggiunge /api/queue, /api/history ecc per la UI.
 app.get('/favicon.ico', ignoreFavicon);
 
 app.use('/api/v2', qbitRoutes);
 app.use('/torznab', torznabRoutes);
-
 
 app.listen(PORT, async () => {
     console.log(`[BOOT] Mock qBittorrent client running on port ${PORT}`);

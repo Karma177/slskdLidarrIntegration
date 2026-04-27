@@ -1,0 +1,6 @@
+{
+  "name": "Lidarr to Slskd Middleware UI",
+  "description": "A web interface to manage downloads bridged from Lidarr into the Soulseek network via Slskd.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

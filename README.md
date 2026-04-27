@@ -9,3 +9,7 @@ This allows you to seamlessly search and download music directly from the Soulse
 - [ ] **Download Cancellation (Lidarr):** Detect when Lidarr removes a download from its queue, and automatically abort/clean up the corresponding transfer in the Slskd client.
 - [ ] **Manual Stops (Slskd):** Detect when a download is manually stopped, paused, or cancelled directly via the Slskd interface, and relay that failure/cancelled state back to Lidarr so it can trigger a fallback search.
 - [ ] **Lucida Integration**.
+- [ ] **Spotify Playlist Transport:** Liked songs, playlists, and more. All automatically downloaded.
+- [ ] **Error Handling** if the error is "No results found", there's no reason in trying again.
+- [ ] **Download Cancellation (WebUI)**
+- [ ] **Manual Review for Weird Imports Toggle**

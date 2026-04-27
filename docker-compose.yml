@@ -17,4 +17,6 @@ services:
       - QUALITY_PREFERENCES=flac 44, flac 48, flac, 320, mp3
       - MAX_RETRIES=3
       - SLSKD_DOWNLOAD_DIR=/slskd_downloads # Same mapped path Lidarr/Slskd uses for downloads
+    volumes:
+      - ./data:/usr/src/app/data
     restart: unless-stopped

@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
 const queueManager = require('../core/queue');
-const config = require('../../config');
+const dbManager = require('../core/db/db-access');
 
 const router = express.Router();
 const upload = multer();
@@ -195,7 +195,7 @@ function handleGetTorrentProperties(req, res) {
         eta = dlspeed > 0 ? remainingBytes / dlspeed : 8640000;
     }
 
-    let basePath = config.slskd.downloadDir || '/app/data/downloads';
+    let basePath = dbManager.getSetting('slskd_download_dir') || '/app/data/downloads';
     if (!basePath.startsWith('/') && !/^[a-zA-Z]:/.test(basePath)) {
         basePath = '/' + basePath;
     }
