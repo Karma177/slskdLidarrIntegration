@@ -73,7 +73,7 @@ export default function App() {
   ] as const;
 
   return (
-    <div className={`min-h-screen flex ${theme === 'dark' ? 'bg-dark-bg text-white' : 'bg-gray-100 text-gray-900'} transition-colors duration-200 font-sans`}>
+    <div className={`h-screen overflow-hidden flex ${theme === 'dark' ? 'bg-dark-bg text-white' : 'bg-gray-100 text-gray-900'} transition-colors duration-200 font-sans`}>
       {/* Sidebar */}
       <aside className={`w-60 flex flex-col p-4 border-r ${theme === 'dark' ? 'bg-black border-dark-border' : 'bg-white border-gray-200'}`}>
         <div className="flex items-center gap-2 mb-8 px-4">

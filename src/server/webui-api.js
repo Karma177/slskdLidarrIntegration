@@ -42,6 +42,8 @@ router.delete('/queue/:hash', (req, res) => {
     const task = queueManager.tasks.get(req.params.hash);
     if (!task) return res.status(404).json({ error: 'Task not found' });
 
+    // Registra nello storico come fallito/rimosso prima di cancellare
+    dbManager.addHistory(task.query, '', '', 'User', 'errored', 'Removed from queue by user');
     queueManager.tasks.delete(req.params.hash);
     console.log(`[API] Utente ha rimosso la traccia dalla coda: ${task.query}`);
 

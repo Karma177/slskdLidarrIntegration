@@ -154,14 +154,13 @@ class QueueManager {
         const fallbacks = task.fallbackOrder; // Es. ['slskd', 'lucida', 'tidal'] ecc
         const currentIndex = task.currentQueueHandlerIndex;
 
-        // Se abbiamo finito tutti i tentativi e tutti i provider... 
+        // Se abbiamo finito tutti i tentativi e tutti i provider...
         if (currentIndex >= fallbacks.length) {
             console.error(`[Queue] Task ${task.query} has exhausted all fallback options. Marking as failed.`);
             task.markAsFailed('Exceeded all fallback handlers. No usable results found.');
+            dbManager.addHistory(task.query, '', '', 'All', 'errored', 'Exceeded all fallback handlers.');
             return;
-        }
-
-        const providerName = fallbacks[currentIndex];
+        }        const providerName = fallbacks[currentIndex];
         console.log(`[Queue] Inviando task ${task.query} al provider: ${providerName} (Fallback: ${currentIndex + 1}/${fallbacks.length})`);
 
         // Otteniamo il gestore corrispondente a questo nome
@@ -300,6 +299,7 @@ class QueueManager {
                 this.recordFailureAndRetry(task, `Lidarr rejected imported files`);
             } else if (lStatus.status === 'imported') {
                 console.log(`[Lidarr] Successfully imported "${task.query}"! Removing from queue.`);
+                dbManager.addHistory(task.query, '', '', 'Slskd', 'completed');
                 this.removeTasks([task.hash]);
             }
         } catch (e) {
@@ -431,10 +431,11 @@ class QueueManager {
                 const queueItem = lidarrQueue.find(q => q.downloadId === hash);
                 if (!queueItem) {
                     // Non c'è più in coda, verifichiamo la cronologia
-                    const histItem = lidarrHistory.find(h => h.downloadId === hash);
+                    const histItem = lidarrHistory.find(h => h.downloadId === hash || (h.downloadId && h.downloadId.toLowerCase() === hash.toLowerCase()));
                     if (histItem) {
                         // Trovato in cronologia, presumibilmente importato
                         console.log(`[Queue] Task ${task.query} appears to be imported already. Removing from active queue.`);
+                        dbManager.addHistory(task.query, '', '', 'Slskd', 'completed');
                         this.removeTasks([hash]);
                     }
                 }

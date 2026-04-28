@@ -101,18 +101,36 @@ function handleAddTorrent(req, res) {
     }
     
     if (urls.includes('SLSKD-MAGIC_')) {
-        // Extract everything until the next ampersand '&'
-        const match = urls.match(/SLSKD-MAGIC_([^&]+)/);
+        // Some clients encode ampersands as &amp; inside XML attributes. Be tolerant
+        // and accept either raw & or the entity. Also log the raw payload for debugging.
+        console.log('[QBI] Raw incoming magnet/urls payload:', urls);
+
+        // Match SLSKD-MAGIC_ up to the next parameter separator. Accept both '&' and '&amp;'
+        const match = urls.match(/SLSKD-MAGIC_([^&]+?)(?:&|&amp;|$)/i);
         if (match && match[1]) {
-            const decoded = decodeURIComponent(match[1]);
-            // Separate the broad filter from the strict network query (FILTER|||NETWORK)
-            const parts = decoded.split('|||');
-            name = parts[0];
-            if (parts.length > 1) {
-                networkQuery = parts[1];
-            } else {
-                networkQuery = name;
+            // Replace HTML encoded ampersands if present, then URI-decode safely
+            let captured = match[1].replace(/&amp;/gi, '&');
+            try {
+                const decoded = decodeURIComponent(captured);
+                // Separate the broad filter from the strict network query (FILTER|||NETWORK)
+                const parts = decoded.split('|||');
+                name = (parts[0] || name).trim();
+                if (parts.length > 1) {
+                    networkQuery = (parts[1] || name).trim();
+                } else {
+                    networkQuery = name;
+                }
+            } catch (e) {
+                // If decodeURIComponent fails, fall back to the raw captured string
+                console.warn('[QBI] Failed to decode SLSKD payload, using raw captured value:', e.message);
+                const parts = captured.split('|||');
+                name = (parts[0] || name).trim();
+                networkQuery = parts[1] ? parts[1].trim() : name;
             }
+            console.log(`[QBI] Parsed SLSKD payload. Name: "${name}" NetworkQuery: "${networkQuery}"`);
+        } else {
+            // No match — log for diagnosis
+            console.warn('[QBI] SLSKD-MAGIC marker present but payload could not be parsed. Payload:', urls);
         }
     } else {
         // Fallback if no magic payload is found
